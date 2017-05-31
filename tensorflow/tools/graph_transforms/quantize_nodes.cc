@@ -56,6 +56,13 @@ struct QuantizedOpInfo {
 // conversion process can transform them.
 const std::vector<QuantizedOpInfo>& GetQuantizedOpList() {
   static const std::vector<QuantizedOpInfo> op_list = {
+      {"Add",
+       {},
+       {{"T1", DT_QUINT8}, {"T2", DT_QUINT8}, {"Toutput", DT_QINT32}},
+       DT_QUINT8,
+       DT_QINT32,
+       {},
+       QuantizedOpInfo::CONTIGUOUS_MIN_MAX},
       {"AvgPool",
        {"ksize", "strides", "padding"},
        {{"T", DT_QUINT8}},
@@ -636,14 +643,25 @@ Status QuantizeNodes(const GraphDef& input_graph_def,
   // The result will end up with a lot of redundant dequantize/quantize pairs
   // between adjacent quantized ops, but a later pass removes these where it
   // can.
+
+  std::set<string> ops_to_ignore;
+  if (context.params.count("ignore_op") > 0) {
+    for (const string& name : context.params.at("ignore_op")) {
+      ops_to_ignore.insert(name);
+    }
+  }
+
   const std::vector<QuantizedOpInfo>& op_list = GetQuantizedOpList();
   string op_pattern;
   bool is_first = true;
   std::map<string, QuantizedOpInfo> op_map;
   for (const QuantizedOpInfo& op_info : op_list) {
-    strings::StrAppend(&op_pattern, (is_first ? "" : "|"), op_info.float_name);
-    op_map.insert({op_info.float_name, op_info});
-    is_first = false;
+    if (ops_to_ignore.count(op_info.float_name) == 0) {
+      strings::StrAppend(&op_pattern, (is_first ? "" : "|"),
+                         op_info.float_name);
+      op_map.insert({op_info.float_name, op_info});
+      is_first = false;
+    }
   }
 
   // If input_min and input max have been passed in, then we convert all float
@@ -930,7 +948,7 @@ Status QuantizeNodes(const GraphDef& input_graph_def,
   // keep interoperability with float ops.
   TF_RETURN_IF_ERROR(RemoveRedundantQuantizations(deduped_graph_def, context,
                                                   output_graph_def));
-  TF_RETURN_IF_ERROR(IsGraphValid(merged_graph_def));
+  TF_RETURN_IF_ERROR(IsGraphValid(*output_graph_def));
 
   return Status::OK();
 }
