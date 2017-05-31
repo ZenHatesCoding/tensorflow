@@ -50,22 +50,24 @@ bool HasXLAKernel(const Node& node, const DeviceType& jit_device_type) {
 }
 
 // Make sure we don't recurse infinitely on recursive functions.
-const int kMaxRecursionDepth = 5;
+const int kMaxRecursionDepth = 10;
 
-bool IsCompilableCall(const NodeDef& call_def, DeviceType jit_device_type,
-                      int depth, FunctionLibraryRuntime* lib_runtime);
+bool IsCompilableCall(const NodeDef& call_def,
+                      const DeviceType& jit_device_type, int depth,
+                      FunctionLibraryRuntime* lib_runtime);
 
-// Tests whether 'while_def' is a completely compilable loop.
+// Tests whether 'while_node' is a completely compilable loop.
 // Every operator in the condition and body functions must be compilable for a
 // while loop to be compilable.
-bool IsCompilableWhile(const NodeDef& while_def, DeviceType jit_device_type,
-                       int depth, FunctionLibraryRuntime* lib_runtime) {
-  VLOG(2) << "Loop marking: " << while_def.op();
+bool IsCompilableWhile(const Node& while_node,
+                       const DeviceType& jit_device_type, int depth,
+                       FunctionLibraryRuntime* lib_runtime) {
+  VLOG(2) << "Loop marking: " << while_node.type_string();
 
   const NameAttrList* name_attr;
   NodeDef call;
   Status status;
-  status = GetNodeAttr(while_def, "cond", &name_attr);
+  status = GetNodeAttr(while_node.attrs(), "cond", &name_attr);
   if (!status.ok()) {
     VLOG(2) << "Missing 'cond' attribute on While node.";
     return false;
@@ -78,7 +80,7 @@ bool IsCompilableWhile(const NodeDef& while_def, DeviceType jit_device_type,
     VLOG(2) << "Can't compile loop condition: " << cond_func;
     return false;
   }
-  status = GetNodeAttr(while_def, "body", &name_attr);
+  status = GetNodeAttr(while_node.attrs(), "body", &name_attr);
   if (!status.ok()) {
     VLOG(2) << "Missing 'body' attribute on While node.";
     return false;
@@ -98,8 +100,9 @@ bool IsCompilableWhile(const NodeDef& while_def, DeviceType jit_device_type,
 // Tests whether 'call_def' is a call to a completely compilable function.
 // Every operator in the function must be compilable for a function to be
 // compilable.
-bool IsCompilableCall(const NodeDef& call_def, DeviceType jit_device_type,
-                      int depth, FunctionLibraryRuntime* lib_runtime) {
+bool IsCompilableCall(const NodeDef& call_def,
+                      const DeviceType& jit_device_type, int depth,
+                      FunctionLibraryRuntime* lib_runtime) {
   VLOG(2) << "Function marking: " << call_def.op();
 
   if (depth > kMaxRecursionDepth) {
@@ -109,21 +112,32 @@ bool IsCompilableCall(const NodeDef& call_def, DeviceType jit_device_type,
 
   FunctionLibraryRuntime::Handle handle;
   Status status =
-      lib_runtime->Instantiate(call_def.op(), call_def.attr(), &handle);
+      lib_runtime->Instantiate(call_def.op(), AttrSlice(call_def), &handle);
   if (!status.ok()) {
     VLOG(2) << "Could not instantiate " << call_def.op() << ": " << status;
     return false;
   }
   const FunctionBody* fbody = lib_runtime->GetFunctionBody(handle);
   CHECK(fbody);
+  const FunctionDef& fdef = fbody->fdef;
+  bool noinline = false;
+  if (GetNodeAttr(AttrSlice(&fdef.attr()), "_noinline", &noinline).ok() &&
+      noinline) {
+    // The underlying mechanism that calls non-inlined functions uses
+    // LocalExecutor, which interacts poorly with the LocalExecutor used by
+    // tf2xla to translate the TF graph into XLA.  So we avoid this for now.
+    //
+    // TODO(b/36139787): Create a mechanism to set inlining hints.
+    VLOG(2) << "Can't compile noinline function: " << fdef.DebugString();
+    return false;
+  }
 
-  for (Node* node : fbody->graph->nodes()) {
-    if (node->IsSource() || node->IsSink()) continue;
-    if (node->def().op() == "_Arg" || node->def().op() == "_Retval") continue;
-    if (node->def().op() == "While") {
+  for (Node* node : fbody->graph->op_nodes()) {
+    if (node->type_string() == "_Arg" || node->type_string() == "_Retval")
+      continue;
+    if (node->type_string() == "While") {
       // Handle functional While loop (not in open source build).
-      return IsCompilableWhile(node->def(), jit_device_type, depth + 1,
-                               lib_runtime);
+      return IsCompilableWhile(*node, jit_device_type, depth + 1, lib_runtime);
     }
     if (!HasXLAKernel(*node, jit_device_type) &&
         !IsCompilableCall(node->def(), jit_device_type, depth + 1,
@@ -147,6 +161,12 @@ Status DeviceTypeOfDevice(const string& device, DeviceType* device_type) {
   return Status::OK();
 }
 
+// Does `node` have a DT_RESOURCE typed argument?
+bool HasResourceArgument(const Node& node) {
+  return std::find(node.input_types().begin(), node.input_types().end(),
+                   DT_RESOURCE) != node.input_types().end();
+}
+
 Status FindCompilationCandidates(
     const Graph& graph, FunctionLibraryDefinition* flib_def, Env* env,
     const std::function<bool(const Node*, const DeviceType&)>& is_compilable_fn,
@@ -155,9 +175,7 @@ Status FindCompilationCandidates(
   std::unique_ptr<FunctionLibraryRuntime> lib_runtime(NewFunctionLibraryRuntime(
       nullptr, env, nullptr, TF_GRAPH_DEF_VERSION, flib_def, opts));
 
-  for (Node* node : graph.nodes()) {
-    if (node->IsSource() || node->IsSink()) continue;
-
+  for (Node* node : graph.op_nodes()) {
     DeviceType device_type("");
     TF_RETURN_IF_ERROR(
         DeviceTypeOfDevice(node->assigned_device_name(), &device_type));
@@ -171,12 +189,16 @@ Status FindCompilationCandidates(
     if (!HasXLAKernel(*node, jit_device_type) &&
         !IsCompilableCall(node->def(), jit_device_type, 0, lib_runtime.get())) {
       VLOG(2) << "Compilation rejected node: unsupported op " << node->name()
-              << ": " << node->def().op();
+              << ": " << node->type_string();
       continue;
     }
-    if (node->def().op() == "While" &&
-        !IsCompilableWhile(node->def(), jit_device_type, 0,
-                           lib_runtime.get())) {
+    if (!registration->compile_resource_ops && HasResourceArgument(*node)) {
+      VLOG(2) << "Compilation rejected node: resource argument " << node->name()
+              << ": " << node->type_string();
+      continue;
+    }
+    if (node->type_string() == "While" &&
+        !IsCompilableWhile(*node, jit_device_type, 0, lib_runtime.get())) {
       continue;
     }
     candidates->insert(node);
@@ -293,10 +315,10 @@ Status MarkForCompilationPass::Run(
 
     // If there is a _XlaCompile annotation, use its value.
     bool compile = false;
-    Status status = GetNodeAttr(node->def(), kXlaCompileAttr, &compile);
+    Status status = GetNodeAttr(node->attrs(), kXlaCompileAttr, &compile);
     if (status.ok()) return compile;
 
-    status = fld->GetAttr(node->def(), kXlaCompileAttr, &compile);
+    status = fld->GetAttr(*node, kXlaCompileAttr, &compile);
     if (status.ok()) return compile;
 
     // Otherwise use the value of global_jit_level.
@@ -434,6 +456,8 @@ Status MarkForCompilationPass::RunImpl(
           "Found control flow node in clustering worklist: ",
           node_from->type_string());
     }
+    string from_scope;
+    string to_scope;
     for (int to : cycles.Successors(from)) {
       if (to >= graph->num_node_ids()) {
         // Node is a "frame" node that is present only in the cycle detection
@@ -441,10 +465,27 @@ Status MarkForCompilationPass::RunImpl(
         continue;
       }
       Node* node_to = graph->FindNodeId(to);
-      if (compilation_candidates.find(node_to) == compilation_candidates.cend())
+      if (compilation_candidates.find(node_to) ==
+          compilation_candidates.cend()) {
         continue;
-      if (node_from->assigned_device_name() != node_to->assigned_device_name())
+      }
+      if (node_from->assigned_device_name() !=
+          node_to->assigned_device_name()) {
         continue;
+      }
+      // Look for an _XlaScope on both nodes.  If both nodes have a
+      // scope and the scopes do not match, do not cluster along this
+      // edge.  If even one of the nodes lacks an _XlaScope attribute,
+      // then it is treated as a "bridge" and a cluster may be created
+      // along it.  We may want to restrict this behavior to require
+      // all nodes marked with _XlaCompile=true to also have a
+      // _XlaScope property set (and raise an error otherwise); but
+      // for now we don't do this.
+      if (GetNodeAttr(node_from->attrs(), kXlaScopeAttr, &from_scope).ok() &&
+          GetNodeAttr(node_to->attrs(), kXlaScopeAttr, &to_scope).ok() &&
+          from_scope != to_scope) {
+        continue;
+      }
 
       // Ops that consume shapes cannot be the root of a cluster. This is an
       // optimization.
@@ -496,10 +537,9 @@ Status MarkForCompilationPass::RunImpl(
     // Compile if the user marked this node _XlaCompile=true
     bool compile_attr = false;
     bool marked_for_compilation = false;
-    if (GetNodeAttr(n->def(), kXlaCompileAttr, &compile_attr).ok()) {
+    if (GetNodeAttr(n->attrs(), kXlaCompileAttr, &compile_attr).ok()) {
       marked_for_compilation = compile_attr;
-    } else if (options.flib_def
-                   ->GetAttr(n->def(), kXlaCompileAttr, &compile_attr)
+    } else if (options.flib_def->GetAttr(*n, kXlaCompileAttr, &compile_attr)
                    .ok()) {
       marked_for_compilation = compile_attr;
     }

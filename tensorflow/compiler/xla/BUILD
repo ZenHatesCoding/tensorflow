@@ -6,6 +6,7 @@ package_group(
     name = "friends",
     packages = [
         "//tensorflow/compiler/...",
+        "//tensorflow/contrib/xla_tf_graph/...",
     ],
 )
 
@@ -16,6 +17,7 @@ package_group(
     ],
 )
 
+load("//tensorflow:tensorflow.bzl", "cc_header_only_library")
 load("//tensorflow/compiler/xla:xla.bzl", "xla_proto_library")
 
 # Filegroup used to collect source files for dependency checking.
@@ -43,11 +45,42 @@ xla_proto_library(
     ],
 )
 
+# This is a headers target that extra XLA devices can use to prevent
+# circular dependencies.  Devices that are compiled as separate shared
+# objects can also use it to prevent linking of library code.
+cc_header_only_library(
+    name = "xla_headers_lib",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//tensorflow/compiler/xla:xla_data_proto",
+        "//tensorflow/compiler/xla:xla_proto",
+        "//tensorflow/compiler/xla/client:client_library",
+        "//tensorflow/compiler/xla/legacy_flags:layout_util_flags",
+        "//tensorflow/compiler/xla/service:hlo",
+        "//tensorflow/core:framework_headers_lib",
+        "//tensorflow/core:stream_executor_headers_lib",
+    ],
+)
+
+cc_library(
+    name = "test",
+    testonly = 1,
+    hdrs = ["test.h"],
+    visibility = [":friends"],
+    deps = [
+        "//tensorflow/core:lib_internal",
+        "//tensorflow/core:test",
+    ],
+)
+
 cc_library(
     name = "types",
     hdrs = ["types.h"],
     visibility = [":friends"],
-    deps = ["//tensorflow/core:lib"],
+    deps = [
+        "//tensorflow/core:lib",
+        "//third_party/eigen3",
+    ],
 )
 
 cc_library(
@@ -80,6 +113,7 @@ cc_test(
     deps = [
         ":status_macros",
         ":statusor",
+        ":test",
         ":test_helpers",
         "//tensorflow/core:lib",
         "//tensorflow/core:test",
@@ -115,6 +149,7 @@ cc_test(
     srcs = ["statusor_test.cc"],
     deps = [
         ":statusor",
+        ":test",
         ":types",
         "//tensorflow/core:lib",
         "//tensorflow/core:test",
@@ -148,7 +183,10 @@ cc_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
+        ":status_macros",
+        ":statusor",
         ":types",
+        ":util",
         "//tensorflow/core:lib",
     ],
 )
@@ -157,9 +195,9 @@ cc_test(
     name = "util_test",
     srcs = ["util_test.cc"],
     deps = [
+        ":test",
         ":types",
         ":util",
-        "//tensorflow/core:test",
         "//tensorflow/core:test_main",
     ],
 )
@@ -198,10 +236,11 @@ cc_test(
     srcs = ["shape_util_test.cc"],
     deps = [
         ":shape_util",
+        ":test",
         ":test_helpers",
         ":types",
         ":util",
-        "//tensorflow/core:test",
+        ":xla_data_proto",
         "//tensorflow/core:test_main",
     ],
 )
@@ -211,6 +250,7 @@ cc_test(
     srcs = ["layout_util_test.cc"],
     deps = [
         ":shape_util",
+        ":test",
         ":test_helpers",
         "//tensorflow/compiler/xla/legacy_flags:layout_util_flags",
         "//tensorflow/core:test",
@@ -223,9 +263,9 @@ cc_test(
     srcs = ["index_util_test.cc"],
     deps = [
         ":shape_util",
+        ":test",
         ":test_helpers",
         ":xla_data_proto",
-        "//tensorflow/core:test",
         "//tensorflow/core:test_main",
     ],
 )
@@ -240,6 +280,7 @@ cc_library(
         ":array3d",
         ":array4d",
         ":shape_util",
+        ":status_macros",
         ":types",
         ":util",
         ":xla_data_proto",
@@ -255,7 +296,7 @@ cc_test(
         ":array4d",
         ":literal_util",
         ":shape_util",
-        ":test_helpers",
+        ":test",
         ":types",
         "//tensorflow/core:lib",
         "//tensorflow/core:test",
@@ -270,7 +311,6 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":util",
-        ":xla_data_proto",
         "//tensorflow/core:lib",
     ],
 )
@@ -303,7 +343,7 @@ cc_test(
     srcs = ["array2d_test.cc"],
     deps = [
         ":array2d",
-        "//tensorflow/core:test",
+        ":test",
         "//tensorflow/core:test_main",
     ],
 )
@@ -323,8 +363,8 @@ cc_test(
     srcs = ["array3d_test.cc"],
     deps = [
         ":array3d",
+        ":test",
         ":types",
-        "//tensorflow/core:test",
         "//tensorflow/core:test_main",
     ],
 )
@@ -345,8 +385,8 @@ cc_test(
     srcs = ["array4d_test.cc"],
     deps = [
         ":array4d",
+        ":test",
         "//tensorflow/core:lib",
-        "//tensorflow/core:test",
         "//tensorflow/core:test_main",
     ],
 )
@@ -356,25 +396,6 @@ cc_library(
     srcs = ["executable_run_options.cc"],
     hdrs = ["executable_run_options.h"],
     visibility = ["//visibility:public"],
-)
-
-cc_library(
-    name = "differential_set",
-    hdrs = ["differential_set.h"],
-    visibility = [":internal"],
-    deps = [
-        "//tensorflow/core:lib",
-    ],
-)
-
-cc_test(
-    name = "differential_set_test",
-    srcs = ["differential_set_test.cc"],
-    deps = [
-        ":differential_set",
-        "//tensorflow/core:test",
-        "//tensorflow/core:test_main",
-    ],
 )
 
 cc_library(
@@ -397,7 +418,6 @@ cc_library(
 cc_library(
     name = "test_helpers",
     testonly = 1,
-    srcs = ["test_helpers.cc"],
     hdrs = ["test_helpers.h"],
     visibility = [":internal"],
     deps = [
@@ -433,11 +453,11 @@ cc_test(
     deps = [
         ":literal_util",
         ":shape_util",
+        ":test",
         ":text_literal_reader",
         ":types",
         ":xla_data_proto",
         "//tensorflow/core:lib",
-        "//tensorflow/core:test",
         "//tensorflow/core:test_main",
     ],
 )
@@ -462,6 +482,7 @@ cc_test(
     srcs = ["text_literal_writer_test.cc"],
     deps = [
         ":literal_util",
+        ":test",
         ":test_helpers",
         ":text_literal_writer",
         ":types",
@@ -490,8 +511,8 @@ cc_test(
     deps = [
         ":shape_tree",
         ":shape_util",
+        ":test",
         ":xla_data_proto",
-        "//tensorflow/core:test",
         "//tensorflow/core:test_main",
     ],
 )
@@ -549,11 +570,11 @@ cc_test(
         ":array4d",
         ":literal_util",
         ":reference_util",
+        ":test",
         ":util",
         ":xla_data_proto",
         "//tensorflow/compiler/xla/client:padding",
         "//tensorflow/compiler/xla/tests:literal_test_util",
-        "//tensorflow/core:test",
         "//tensorflow/core:test_main",
     ],
 )
